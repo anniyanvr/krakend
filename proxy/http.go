@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 
-	"github.com/luraproject/lura/config"
-	"github.com/luraproject/lura/encoding"
-	"github.com/luraproject/lura/transport/http/client"
+	"github.com/luraproject/lura/v3/config"
+	"github.com/luraproject/lura/v3/encoding"
+	"github.com/luraproject/lura/v3/logging"
+	"github.com/luraproject/lura/v3/transport/http/client"
 )
 
 var httpProxy = CustomHTTPProxyFactory(client.NewHTTPClient)
@@ -33,7 +37,7 @@ func NewHTTPProxy(remote *config.Backend, cf client.HTTPClientFactory, decode en
 }
 
 // NewHTTPProxyWithHTTPExecutor creates a http proxy with the injected configuration, HTTPRequestExecutor and Decoder
-func NewHTTPProxyWithHTTPExecutor(remote *config.Backend, re client.HTTPRequestExecutor, dec encoding.Decoder) Proxy {
+var NewHTTPProxyWithHTTPExecutor = func(remote *config.Backend, re client.HTTPRequestExecutor, dec encoding.Decoder) Proxy {
 	if remote.Encoding == encoding.NOOP {
 		return NewHTTPProxyDetailed(remote, re, client.NoOpHTTPStatusHandler, NoOpHTTPResponseParser)
 	}
@@ -43,32 +47,68 @@ func NewHTTPProxyWithHTTPExecutor(remote *config.Backend, re client.HTTPRequestE
 	return NewHTTPProxyDetailed(remote, re, client.GetHTTPStatusHandler(remote), rp)
 }
 
+const (
+	clientHTTPOptions            string = "backend/http/client"
+	clientHTTPOptionRedirectPost string = "send_body_on_redirect"
+)
+
+// redirectPostReaderFactory checks if the clientHTTPOptionRedirectPost is enabled
+// This will read the body and return a bytes.Buffer with the body content, so we
+// delegate to http.NewRequest the population of request.GetBody so a redirect (307
+// and 308) is executed while maintaining the method and the body
+// This is necessary since the request comes from another http.Client and it's not
+// a concrete type that can be copied but just a io.ReaderCloser (*http.body)
+func redirectPostReaderFactory(cfg *config.Backend) func(r io.ReadCloser) io.Reader {
+	emptyFactory := func(r io.ReadCloser) io.Reader { return r }
+	if cfg == nil || cfg.ExtraConfig == nil {
+		return emptyFactory
+	}
+	v, ok := cfg.ExtraConfig[clientHTTPOptions].(map[string]interface{})
+	if !ok {
+		return emptyFactory
+	}
+	if opt, ok := v[clientHTTPOptionRedirectPost].(bool); !ok || !opt {
+		return emptyFactory
+	}
+	return func(r io.ReadCloser) io.Reader {
+		if r == http.NoBody || r == nil {
+			return r
+		}
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r)
+		r.Close()
+		return buf
+	}
+}
+
 // NewHTTPProxyDetailed creates a http proxy with the injected configuration, HTTPRequestExecutor,
 // Decoder and HTTPResponseParser
-func NewHTTPProxyDetailed(remote *config.Backend, re client.HTTPRequestExecutor, ch client.HTTPStatusHandler, rp HTTPResponseParser) Proxy {
+func NewHTTPProxyDetailed(cfg *config.Backend, re client.HTTPRequestExecutor, ch client.HTTPStatusHandler, rp HTTPResponseParser) Proxy {
+	bodyFactory := redirectPostReaderFactory(cfg)
 	return func(ctx context.Context, request *Request) (*Response, error) {
-		requestToBakend, err := http.NewRequest(strings.ToTitle(request.Method), request.URL.String(), request.Body)
+		requestToBackend, err := http.NewRequest(strings.ToTitle(request.Method), request.URL.String(), bodyFactory(request.Body))
 		if err != nil {
 			return nil, err
 		}
-		requestToBakend.Header = make(map[string][]string, len(request.Headers))
+		requestToBackend.Header = make(map[string][]string, len(request.Headers))
 		for k, vs := range request.Headers {
 			tmp := make([]string, len(vs))
 			copy(tmp, vs)
-			requestToBakend.Header[k] = tmp
+			requestToBackend.Header[k] = tmp
 		}
 		if request.Body != nil {
 			if v, ok := request.Headers["Content-Length"]; ok && len(v) == 1 && v[0] != "chunked" {
 				if size, err := strconv.Atoi(v[0]); err == nil {
-					requestToBakend.ContentLength = int64(size)
+					requestToBackend.ContentLength = int64(size)
 				}
 			}
 		}
 
-		resp, err := re(ctx, requestToBakend)
-		if requestToBakend.Body != nil {
-			requestToBakend.Body.Close()
+		resp, err := re(ctx, requestToBackend)
+		if requestToBackend.Body != nil {
+			requestToBackend.Body.Close()
 		}
+
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -96,17 +136,25 @@ func NewHTTPProxyDetailed(remote *config.Backend, re client.HTTPRequestExecutor,
 }
 
 // NewRequestBuilderMiddleware creates a proxy middleware that parses the request params received
-// from the outter layer and generates the path to the backend endpoints
-func NewRequestBuilderMiddleware(remote *config.Backend) Middleware {
+// from the outer layer and generates the path to the backend endpoints
+var NewRequestBuilderMiddleware = func(remote *config.Backend) Middleware {
+	return newRequestBuilderMiddleware(logging.NoOp, remote)
+}
+
+func NewRequestBuilderMiddlewareWithLogger(logger logging.Logger, remote *config.Backend) Middleware {
+	return newRequestBuilderMiddleware(logger, remote)
+}
+
+func newRequestBuilderMiddleware(l logging.Logger, remote *config.Backend) Middleware {
 	return func(next ...Proxy) Proxy {
 		if len(next) > 1 {
-			panic(ErrTooManyProxies)
+			l.Fatal("too many proxies for this %s %s -> %s proxy middleware: newRequestBuilderMiddleware only accepts 1 proxy, got %d", remote.ParentEndpointMethod, remote.ParentEndpoint, remote.URLPattern, len(next))
+			return nil
 		}
-		return func(ctx context.Context, request *Request) (*Response, error) {
-			r := request.Clone()
+		return func(ctx context.Context, r *Request) (*Response, error) {
 			r.GeneratePath(remote.URLPattern)
 			r.Method = remote.Method
-			return next[0](ctx, &r)
+			return next[0](ctx, r)
 		}
 	}
 }

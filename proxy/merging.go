@@ -1,50 +1,189 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/luraproject/lura/config"
+	"github.com/luraproject/lura/v3/config"
+	"github.com/luraproject/lura/v3/logging"
 )
 
 // NewMergeDataMiddleware creates proxy middleware for merging responses from several backends
-func NewMergeDataMiddleware(endpointConfig *config.EndpointConfig) Middleware {
+func NewMergeDataMiddleware(logger logging.Logger, endpointConfig *config.EndpointConfig) Middleware { // skipcq: GO-R1005
 	totalBackends := len(endpointConfig.Backend)
 	if totalBackends == 0 {
-		panic(ErrNoBackends)
+		logger.Fatal("all endpoints must have at least one backend: NewMergeDataMiddleware")
+		return nil
 	}
 	if totalBackends == 1 {
-		return EmptyMiddleware
+		return emptyMiddlewareFallback(logger)
 	}
 	serviceTimeout := time.Duration(85*endpointConfig.Timeout.Nanoseconds()/100) * time.Nanosecond
 	combiner := getResponseCombiner(endpointConfig.ExtraConfig)
 
+	mf, t := getMergerFactory(endpointConfig.ExtraConfig)
+	logger.Debug(
+		fmt.Sprintf(
+			"[ENDPOINT: %s %s][Merge] Backends: %d, merger: %s, combiner: %s",
+			endpointConfig.Method,
+			endpointConfig.Endpoint,
+			totalBackends,
+			t,
+			getResponseCombinerName(endpointConfig.ExtraConfig),
+		),
+	)
+	m := mf(endpointConfig)
+	bfFactory := backendFiltererFactory.filtererFactory
 	return func(next ...Proxy) Proxy {
 		if len(next) != totalBackends {
-			panic(ErrNotEnoughProxies)
+			// we leave the panic here, because we do not want to continue
+			// if this configuration is wrong, as it would lead to unexpected
+			// behaviour.
+			logger.Fatal("not enough proxies for this endpoint: NewMergeDataMiddleware")
+			return nil
+		}
+		reqClone := func(r *Request) *Request { res := r.Clone(); return &res }
+
+		filters, err := bfFactory(endpointConfig)
+		if err != nil {
+			logger.Error(fmt.Sprintf("[ENDPOINT: %s %s]%s %s",
+				endpointConfig.Method, endpointConfig.Endpoint,
+				backendFiltererFactory.logPrefix, err))
+			return func(_ context.Context, _ *Request) (*Response, error) { return nil, err }
 		}
 
-		if !shouldRunSequentialMerger(endpointConfig) {
-			return parallelMerge(serviceTimeout, combiner, next...)
+		if hasUnsafeBackends(endpointConfig) || forceDeepClone(endpointConfig) {
+			reqClone = CloneRequest
 		}
 
-		patterns := make([]string, len(endpointConfig.Backend))
-		for i, b := range endpointConfig.Backend {
-			patterns[i] = b.URLPattern
-		}
-		return sequentialMerge(patterns, serviceTimeout, combiner, next...)
+		return m(reqClone, serviceTimeout, combiner, filters, next...)
 	}
 }
 
-func shouldRunSequentialMerger(endpointConfig *config.EndpointConfig) bool {
-	if v, ok := endpointConfig.ExtraConfig[Namespace]; ok {
+func getMergerFactory(cfg config.ExtraConfig) (MergerFactory, string) {
+	var v interface{}
+	var ok bool
+	var m map[string]interface{}
+	if v, ok = cfg[Namespace]; !ok {
+		return mergers[parallelMerger], parallelMerger
+	}
+
+	if m, ok = v.(map[string]interface{}); !ok {
+		return mergers[parallelMerger], parallelMerger
+	}
+
+	if v, ok = m[typeKey]; !ok {
+		if v, ok := m[isSequentialKey]; ok {
+			c, ok := v.(bool)
+			if ok && c {
+				return mergers[isSequentialKey], isSequentialKey
+			}
+		}
+
+		return mergers[parallelMerger], parallelMerger
+	}
+
+	var t string
+	if t, ok = v.(string); !ok {
+		return mergers[parallelMerger], parallelMerger
+	}
+
+	if mf, ok := mergers[t]; ok {
+		return mf, t
+	}
+
+	return mergers[parallelMerger], parallelMerger
+}
+
+type (
+	// Merger is a function that controls how multiple backends are executed,
+	// collects responses and returns a single response and error.
+	Merger func(func(*Request) *Request, time.Duration, ResponseCombiner, []BackendFilterer, ...Proxy) Proxy
+	// MergerFactory returns a Merger.
+	MergerFactory func(*config.EndpointConfig) Merger
+)
+
+var mergers = map[string]MergerFactory{
+	isSequentialKey: func(ec *config.EndpointConfig) Merger {
+		sequentialReplacements := sequentialMergerConfig(ec)
+		return func(
+			reqClone func(*Request) *Request,
+			serviceTimeout time.Duration,
+			combiner ResponseCombiner,
+			filters []BackendFilterer,
+			next ...Proxy,
+		) Proxy {
+			return sequentialMerge(reqClone, serviceTimeout, combiner, sequentialReplacements, filters, next...)
+		}
+	},
+	parallelMerger: func(_ *config.EndpointConfig) Merger {
+		return parallelMerge
+	},
+}
+
+// RegisterMergerFactory registers a new merger factory to be used by the merging middleware.
+func RegisterMergerFactory(name string, m MergerFactory) {
+	mergers[name] = m
+}
+
+// BackendFiltererFactory is a factory function that returns a list of BackendFilterer
+// based on the provided EndpointConfig.
+// The returned list must be sorted by the backend index.
+// The list can contain nil values, which means that the backend in that index is untouched.
+type BackendFiltererFactory func(*config.EndpointConfig) ([]BackendFilterer, error)
+
+// BackendFilterer evalutes the request and returns true if the backend should be used,
+// otherwise the backend is skipped in both normal and sequential merging.
+// If the backend is skipped, the response will not be merged into the final response.
+type BackendFilterer func(*Request) bool
+
+func defaultBackendFiltererFactory(_ *config.EndpointConfig) ([]BackendFilterer, error) {
+	return []BackendFilterer{}, nil
+}
+
+type backendFiltererRegistry struct {
+	logPrefix       string
+	filtererFactory BackendFiltererFactory
+}
+
+var backendFiltererFactory = backendFiltererRegistry{
+	filtererFactory: defaultBackendFiltererFactory,
+}
+
+// RegisterBackendFiltererFactory registers a new backend filterer factory
+// to be used by the merging middleware.
+// This factory is used to create a list of BackendFilterer
+// functions that will be used to filter backends based on the request.
+// Important: this function should be called everytime the middleware is created.
+func RegisterBackendFiltererFactory(logPrefix string, f BackendFiltererFactory) {
+	backendFiltererFactory.logPrefix = logPrefix
+	backendFiltererFactory.filtererFactory = f
+}
+
+func ResetBackendFiltererFactory() {
+	backendFiltererFactory.logPrefix = ""
+	backendFiltererFactory.filtererFactory = defaultBackendFiltererFactory
+}
+
+type sequentialBackendReplacement struct {
+	backendIndex int
+	destination  string
+	source       []string
+	fullResponse bool
+}
+
+func forceDeepClone(cfg *config.EndpointConfig) bool {
+	if v, ok := cfg.ExtraConfig[Namespace]; ok {
 		if e, ok := v.(map[string]interface{}); ok {
-			if v, ok := e[isSequentialKey]; ok {
+			if v, ok := e[forceDeepCloneKey]; ok {
 				c, ok := v.(bool)
 				return ok && c
 			}
@@ -53,19 +192,112 @@ func shouldRunSequentialMerger(endpointConfig *config.EndpointConfig) bool {
 	return false
 }
 
-func parallelMerge(timeout time.Duration, rc ResponseCombiner, next ...Proxy) Proxy {
+func sequentialMergerConfig(cfg *config.EndpointConfig) [][]sequentialBackendReplacement { // skipcq: GO-R1005
+	totalBackends := len(cfg.Backend)
+	sequentialReplacements := make([][]sequentialBackendReplacement, totalBackends)
+	var propagatedParams []string
+
+	if v, ok := cfg.ExtraConfig[Namespace]; ok {
+		if e, ok := v.(map[string]interface{}); ok {
+			if v, ok := e[sequentialPropagateKey]; ok {
+				if a, ok := v.([]interface{}); ok {
+					for _, p := range a {
+						propagatedParams = append(propagatedParams, p.(string))
+					}
+				}
+			}
+		}
+	}
+	rePropagatedParams := regexp.MustCompile(`[Rr]esp(\d+)_?([\w-.]+)?`)
+	reUrlPatterns := regexp.MustCompile(`\{\{\.Resp(\d+)_([\w-.]+)\}\}`)
+	destKeyGenerator := func(i string, t string) string {
+		key := "Resp" + i
+		if t != "" {
+			key += "_" + t
+		}
+		return key
+	}
+
+	for i, b := range cfg.Backend {
+		for _, match := range reUrlPatterns.FindAllStringSubmatch(b.URLPattern, -1) {
+			if len(match) > 1 {
+				backendIndex, err := strconv.Atoi(match[1])
+				if err != nil {
+					continue
+				}
+
+				sequentialReplacements[i] = append(sequentialReplacements[i], sequentialBackendReplacement{
+					backendIndex: backendIndex,
+					destination:  destKeyGenerator(match[1], match[2]),
+					source:       strings.Split(match[2], "."),
+					fullResponse: match[2] == "",
+				})
+			}
+		}
+
+		if i > 0 {
+			for _, p := range propagatedParams {
+				for _, match := range rePropagatedParams.FindAllStringSubmatch(p, -1) {
+					if len(match) > 1 {
+						backendIndex, err := strconv.Atoi(match[1])
+						if err != nil || backendIndex >= totalBackends {
+							continue
+						}
+
+						sequentialReplacements[i] = append(sequentialReplacements[i], sequentialBackendReplacement{
+							backendIndex: backendIndex,
+							destination:  destKeyGenerator(match[1], match[2]),
+							source:       strings.Split(match[2], "."),
+							fullResponse: match[2] == "",
+						})
+					}
+				}
+			}
+		}
+	}
+	return sequentialReplacements
+}
+
+func hasUnsafeBackends(cfg *config.EndpointConfig) bool {
+	if len(cfg.Backend) == 1 {
+		return false
+	}
+
+	for _, b := range cfg.Backend {
+		if m := strings.ToUpper(b.Method); m != http.MethodGet && m != http.MethodHead {
+			return true
+		}
+	}
+
+	return false
+}
+
+func parallelMerge(
+	reqCloner func(*Request) *Request,
+	timeout time.Duration,
+	rc ResponseCombiner,
+	filters []BackendFilterer,
+	next ...Proxy,
+) Proxy {
 	return func(ctx context.Context, request *Request) (*Response, error) {
 		localCtx, cancel := context.WithTimeout(ctx, timeout)
 
-		parts := make(chan *Response, len(next))
-		failed := make(chan error, len(next))
+		proxyCount := len(next)
+		filterCount := len(filters)
 
-		for _, n := range next {
-			go requestPart(localCtx, n, request, false, parts, failed)
+		parts := make(chan *Response, proxyCount)
+		failed := make(chan error, proxyCount)
+
+		for i, n := range next {
+			if (i < filterCount) && (filters[i] != nil) && !filters[i](request) {
+				proxyCount--
+				continue
+			}
+			go requestPart(localCtx, n, reqCloner(request), parts, failed)
 		}
 
-		acc := newIncrementalMergeAccumulator(len(next), rc)
-		for i := 0; i < len(next); i++ {
+		acc := newIncrementalMergeAccumulator(proxyCount, rc)
+		for i := 0; i < proxyCount; i++ {
 			select {
 			case err := <-failed:
 				acc.Merge(nil, err)
@@ -80,79 +312,111 @@ func parallelMerge(timeout time.Duration, rc ResponseCombiner, next ...Proxy) Pr
 	}
 }
 
-var reMergeKey = regexp.MustCompile(`\{\{\.Resp(\d+)_([\d\w-_\.]+)\}\}`)
-
-func sequentialMerge(patterns []string, timeout time.Duration, rc ResponseCombiner, next ...Proxy) Proxy {
+func sequentialMerge( // skipcq: GO-R1005
+	reqCloner func(*Request) *Request,
+	timeout time.Duration,
+	rc ResponseCombiner,
+	sequentialReplacements [][]sequentialBackendReplacement,
+	filters []BackendFilterer,
+	next ...Proxy,
+) Proxy {
 	return func(ctx context.Context, request *Request) (*Response, error) {
 		localCtx, cancel := context.WithTimeout(ctx, timeout)
 
+		filterCount := len(filters)
 		parts := make([]*Response, len(next))
 		out := make(chan *Response, 1)
 		errCh := make(chan error, 1)
+		sequentialMergeRegistry := map[string]string{}
 
 		acc := newIncrementalMergeAccumulator(len(next), rc)
 	TxLoop:
 		for i, n := range next {
 			if i > 0 {
-				for _, match := range reMergeKey.FindAllStringSubmatch(patterns[i], -1) {
-					if len(match) > 1 {
-						rNum, err := strconv.Atoi(match[1])
-						if err != nil || rNum >= i || parts[rNum] == nil {
-							continue
-						}
-						key := "Resp" + match[1] + "_" + match[2]
+				for _, r := range sequentialReplacements[i] {
+					if r.backendIndex >= i || parts[r.backendIndex] == nil {
+						continue
+					}
 
-						var v interface{}
-						var ok bool
+					var v interface{}
+					var ok bool
 
-						data := parts[rNum].Data
-						keys := strings.Split(match[2], ".")
-						if len(keys) > 1 {
-							for _, k := range keys[:len(keys)-1] {
-								v, ok = data[k]
-								if !ok {
-									break
-								}
-								switch clean := v.(type) {
-								case map[string]interface{}:
-									data = clean
-								default:
-									break
-								}
+					data := parts[r.backendIndex].Data
+					if len(r.source) > 1 {
+						for _, k := range r.source[:len(r.source)-1] {
+							v, ok = data[k]
+							if !ok {
+								break
 							}
-						}
-
-						v, ok = data[keys[len(keys)-1]]
-						if !ok {
-							continue
-						}
-						switch clean := v.(type) {
-						case []interface{}:
-							if len(clean) == 0 {
-								request.Params[key] = ""
-								continue
+							clean, ok := v.(map[string]interface{})
+							if !ok {
+								break
 							}
-							var b strings.Builder
-							for i := 0; i < len(clean)-1; i++ {
-								fmt.Fprintf(&b, "%v,", clean[i])
-							}
-							fmt.Fprintf(&b, "%v", clean[len(clean)-1])
-							request.Params[key] = b.String()
-						case string:
-							request.Params[key] = clean
-						case int:
-							request.Params[key] = strconv.Itoa(clean)
-						case float64:
-							request.Params[key] = strconv.FormatFloat(clean, 'E', -1, 32)
-						case bool:
-							request.Params[key] = strconv.FormatBool(clean)
-						default:
-							request.Params[key] = fmt.Sprintf("%v", v)
+							data = clean
 						}
 					}
+
+					if found := sequentialMergeRegistry[r.destination]; found != "" {
+						request.Params[r.destination] = found
+						continue
+					}
+
+					if r.fullResponse {
+						if parts[r.backendIndex].Io == nil {
+							continue
+						}
+						buf, err := io.ReadAll(parts[r.backendIndex].Io)
+
+						if err == nil {
+							request.Params[r.destination] = string(buf)
+							sequentialMergeRegistry[r.destination] = string(buf)
+						}
+						continue
+					}
+
+					v, ok = data[r.source[len(r.source)-1]]
+					if !ok {
+						continue
+					}
+
+					var param string
+
+					switch clean := v.(type) {
+					case []interface{}:
+						if len(clean) == 0 {
+							request.Params[r.destination] = ""
+							break
+						}
+						var b strings.Builder
+						for i := 0; i < len(clean)-1; i++ {
+							fmt.Fprintf(&b, "%v,", clean[i])
+						}
+						fmt.Fprintf(&b, "%v", clean[len(clean)-1])
+						param = b.String()
+					case string:
+						param = clean
+					case int:
+						param = strconv.Itoa(clean)
+					case float64:
+						param = strconv.FormatFloat(clean, 'E', -1, 32)
+					case bool:
+						param = strconv.FormatBool(clean)
+					default:
+						param = fmt.Sprintf("%v", v)
+					}
+					request.Params[r.destination] = param
+					sequentialMergeRegistry[r.destination] = param
 				}
 			}
-			requestPart(localCtx, n, request, true, out, errCh)
+
+			if (i < filterCount) && (filters[i] != nil) && !filters[i](request) {
+				parts[i] = &Response{IsComplete: true, Data: make(map[string]interface{})}
+				acc.pending--
+				continue
+			}
+
+			sequentialRequestPart(localCtx, n, reqCloner(request), out, errCh)
+
 			select {
 			case err := <-errCh:
 				if i == 0 {
@@ -213,29 +477,19 @@ func (i *incrementalMergeAccumulator) Merge(res *Response, err error) {
 
 func (i *incrementalMergeAccumulator) Result() (*Response, error) {
 	if i.data == nil {
-		return &Response{Data: make(map[string]interface{}, 0), IsComplete: false}, newMergeError(i.errs)
+		return nil, newMergeError(i.errs)
 	}
 
-	if i.pending != 0 || len(i.errs) != 0 {
+	if i.pending > 0 || len(i.errs) > 0 {
 		i.data.IsComplete = false
 	}
 	return i.data, newMergeError(i.errs)
 }
 
-func requestPart(ctx context.Context, next Proxy, request *Request, sequential bool, out chan<- *Response, failed chan<- error) {
+func requestPart(ctx context.Context, next Proxy, request *Request, out chan<- *Response, failed chan<- error) {
 	localCtx, cancel := context.WithCancel(ctx)
 
-	var copyRequest *Request
-	if sequential {
-		copyRequest = CloneRequest(request)
-	}
-
 	in, err := next(localCtx, request)
-
-	if sequential {
-		*request = *copyRequest
-	}
-
 	if err != nil {
 		failed <- err
 		cancel()
@@ -252,6 +506,23 @@ func requestPart(ctx context.Context, next Proxy, request *Request, sequential b
 		failed <- ctx.Err()
 	}
 	cancel()
+}
+
+func sequentialRequestPart(ctx context.Context, next Proxy, request *Request, out chan<- *Response, failed chan<- error) {
+	in, err := next(ctx, request)
+	if err != nil {
+		failed <- err
+		return
+	}
+	if in == nil {
+		failed <- errNullResult
+		return
+	}
+	select {
+	case out <- in:
+	case <-ctx.Done():
+		failed <- ctx.Err()
+	}
 }
 
 func newMergeError(errs []error) error {
@@ -273,6 +544,10 @@ func (m mergeError) Error() string {
 	return strings.Join(msg, "\n")
 }
 
+func (m mergeError) Errors() []error {
+	return m.errs
+}
+
 // ResponseCombiner func to merge the collected responses into a single one
 type ResponseCombiner func(int, []*Response) *Response
 
@@ -282,9 +557,13 @@ func RegisterResponseCombiner(name string, f ResponseCombiner) {
 }
 
 const (
-	mergeKey            = "combiner"
-	isSequentialKey     = "sequential"
-	defaultCombinerName = "default"
+	forceDeepCloneKey      = "force_sandboxed_request"
+	mergeKey               = "combiner"
+	isSequentialKey        = "sequential"
+	parallelMerger         = "parallel"
+	sequentialPropagateKey = "sequential_propagated_params"
+	defaultCombinerName    = "default"
+	typeKey                = "strategy"
 )
 
 var responseCombiners = initResponseCombiners()
@@ -293,18 +572,23 @@ func initResponseCombiners() *combinerRegister {
 	return newCombinerRegister(map[string]ResponseCombiner{defaultCombinerName: combineData}, combineData)
 }
 
-func getResponseCombiner(extra config.ExtraConfig) ResponseCombiner {
-	combiner, _ := responseCombiners.GetResponseCombiner(defaultCombinerName)
+func getResponseCombinerName(extra config.ExtraConfig) string {
 	if v, ok := extra[Namespace]; ok {
 		if e, ok := v.(map[string]interface{}); ok {
 			if v, ok := e[mergeKey]; ok {
-				if c, ok := responseCombiners.GetResponseCombiner(v.(string)); ok {
-					combiner = c
+				if _, ok := responseCombiners.GetResponseCombiner(v.(string)); ok {
+					return v.(string)
 				}
 			}
 		}
 	}
-	return combiner
+	return defaultCombinerName
+}
+
+func getResponseCombiner(extra config.ExtraConfig) ResponseCombiner {
+	combiner := getResponseCombinerName(extra)
+	c, _ := responseCombiners.GetResponseCombiner(combiner)
+	return c
 }
 
 func combineData(total int, parts []*Response) *Response {
@@ -317,7 +601,7 @@ func combineData(total int, parts []*Response) *Response {
 		}
 		isComplete = isComplete && part.IsComplete
 		if retResponse == nil {
-			retResponse = part
+			retResponse = &Response{Data: part.Data, IsComplete: isComplete}
 			continue
 		}
 		for k, v := range part.Data {
@@ -327,7 +611,7 @@ func combineData(total int, parts []*Response) *Response {
 
 	if nil == retResponse {
 		// do not allow nil data in the response:
-		return &Response{Data: make(map[string]interface{}, 0), IsComplete: isComplete}
+		return &Response{Data: make(map[string]interface{}), IsComplete: isComplete}
 	}
 	retResponse.IsComplete = isComplete
 	return retResponse

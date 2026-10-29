@@ -1,10 +1,18 @@
 {
-    "version": 2,
+    "version": 4,
     "name": "My lovely gateway",
     "port": {{.port}},
     "host": [ "http://local.machine" ],
     "cache_ttl": "3600s",
     "timeout": "3s",
+    "extra_config":{
+        "router":{
+            "return_error_msg":true
+        },
+        "github_com/luraproject/lura/router/mux":{
+            "return_error_msg":true
+        }
+    },
     "endpoints": [
         {
             "endpoint": "/static",
@@ -17,7 +25,7 @@
                 }
             ],
             "extra_config": {
-                "github.com/devopsfaith/krakend/proxy": {
+                "proxy": {
                     "static": {
                         "strategy": "errored",
                         "data": {
@@ -31,7 +39,7 @@
         {
             "endpoint": "/param_forwarding/{first}/constant/{second}",
             "method": "POST",
-            "headers_to_pass": [
+            "input_headers": [
                 "Content-Type",
                 "Authorization",
                 "X-Y-Z"
@@ -104,7 +112,7 @@
                 }
             ],
             "extra_config": {
-                "github.com/devopsfaith/krakend/proxy": {
+                "proxy": {
                     "static": {
                         "strategy": "incomplete",
                         "data": {
@@ -124,7 +132,7 @@
                     ],
                     "url_pattern": "/",
                     "extra_config": {
-                        "github.com/devopsfaith/krakend/http": {
+                        "backend/http": {
                             "return_error_details": "backend_a"
                         }
                     }
@@ -135,7 +143,7 @@
                     ],
                     "url_pattern": "/",
                     "extra_config": {
-                        "github.com/devopsfaith/krakend/http": {
+                        "backend/http": {
                             "return_error_details": "backend_b"
                         }
                     }
@@ -170,7 +178,7 @@
         },
         {
             "endpoint": "/querystring-params-test/query-params",
-            "querystring_params": [ "a", "b" ],
+            "input_query_strings": [ "a", "b" ],
             "backend": [
                 {
                     "host": [ "{{.b6}}" ],
@@ -189,7 +197,7 @@
         },
         {
             "endpoint": "/querystring-params-test/all-params",
-            "querystring_params": [ "*" ],
+            "input_query_strings": [ "*" ],
             "backend": [
                 {
                     "host": [ "{{.b6}}" ],
@@ -208,7 +216,7 @@
         },
         {
             "endpoint": "/header-params-test/filter-params",
-            "headers_to_pass": [ "X-Test-1" ],
+            "input_headers": [ "X-Test-1" ],
             "backend": [
                 {
                     "host": [ "{{.b6}}" ],
@@ -218,7 +226,7 @@
         },
         {
             "endpoint": "/header-params-test/all-params",
-            "headers_to_pass": [ "*" ],
+            "input_headers": [ "*" ],
             "backend": [
                 {
                     "host": [ "{{.b6}}" ],
@@ -229,7 +237,7 @@
         {
           "endpoint": "/sequential/ok/{param}",
           "extra_config": {
-            "github.com/devopsfaith/krakend/proxy": {
+            "proxy": {
               "sequential": true
             }
           },
@@ -249,7 +257,7 @@
         {
           "endpoint": "/sequential/ko/first/{param}",
           "extra_config": {
-            "github.com/devopsfaith/krakend/proxy": {
+            "proxy": {
               "sequential": true
             }
           },
@@ -257,19 +265,19 @@
             {
               "url_pattern": "/provider/{param}",
               "host": [ "{{.b4}}" ],
-              "whitelist": [ "random" ]
+              "allow": [ "random" ]
             },
             {
               "url_pattern": "/recipient/{resp0_random}",
               "host": [ "{{.b7}}" ],
-              "whitelist": [ "path" ]
+              "allow": [ "path" ]
             }
           ]
         },
         {
           "endpoint": "/sequential/ko/last/{param}",
           "extra_config": {
-            "github.com/devopsfaith/krakend/proxy": {
+            "proxy": {
               "sequential": true
             }
           },
@@ -277,12 +285,59 @@
             {
               "url_pattern": "/provider/{param}",
               "host": [ "{{.b7}}" ],
-              "whitelist": [ "random" ]
+              "allow": [ "random" ]
             },
             {
               "url_pattern": "/recipient/{resp0_random}",
               "host": [ "{{.b4}}" ],
-              "whitelist": [ "path" ]
+              "allow": [ "path" ]
+            }
+          ]
+        },
+        {
+          "endpoint": "/multipost/sequential/{param}",
+          "method":"POST",
+          "extra_config": {
+            "proxy": {
+              "sequential": true
+            }
+          },
+          "backend": [
+            {
+              "url_pattern": "/provider/{param}",
+              "host": [ "{{.b7}}" ],
+              "method":"GET",
+              "group": "first"
+            },
+            {
+              "url_pattern": "/recipient/{resp0_first.random}",
+              "host": [ "{{.b12}}" ],
+              "method":"POST",
+              "group": "second"
+            },
+            {
+              "url_pattern": "/recipient/{resp0_first.random}",
+              "host": [ "{{.b12}}" ],
+              "method":"POST",
+              "group": "third"
+            }
+          ]
+        },
+        {
+          "endpoint": "/multipost/parallel/{param}",
+          "method":"POST",
+          "backend": [
+            {
+              "url_pattern": "/provider/{param}",
+              "host": [ "{{.b12}}" ],
+              "method":"POST",
+              "group": "first"
+            },
+            {
+              "url_pattern": "/recipient/{param}",
+              "host": [ "{{.b12}}" ],
+              "method":"POST",
+              "group": "second"
             }
           ]
         },
@@ -314,7 +369,7 @@
                     "url_pattern": "/",
                     "is_collection": true,
                     "extra_config": {
-                        "github.com/devopsfaith/krakend/proxy": {
+                        "proxy": {
                           "flatmap_filter": [
                             {
                                 "type": "del",
@@ -336,7 +391,7 @@
                     "url_pattern": "/",
                     "is_collection": true,
                     "extra_config": {
-                        "github.com/devopsfaith/krakend/proxy": {
+                        "proxy": {
                           "flatmap_filter": [
                             {
                                 "type": "move",
@@ -361,7 +416,7 @@
             "endpoint": "/sequence-accept",
             "method": "PUT",
             "extra_config": {
-                "github.com/devopsfaith/krakend/proxy": {
+                "proxy": {
                     "sequential": true
                 }
             },
@@ -379,6 +434,57 @@
                         "{{.b3}}"
                     ],
                     "url_pattern": "/"
+                }
+            ]
+        },
+        {
+            "endpoint": "/error-status-code/1",
+            "backend": [
+                {
+                    "host": [ "{{.b3}}" ],
+                    "url_pattern": "/",
+                    "extra_config":{
+                        "backend/http":{
+                            "return_error_code":true
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "endpoint": "/error-status-code/2",
+            "backend": [
+                {
+                    "host": [ "{{.b4}}" ],
+                    "url_pattern": "/",
+                    "extra_config":{
+                        "backend/http":{
+                            "return_error_code":true
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "endpoint": "/error-status-code/3",
+            "backend": [
+                {
+                    "host": [ "{{.b3}}" ],
+                    "url_pattern": "/",
+                    "extra_config":{
+                        "backend/http":{
+                            "return_error_code":true
+                        }
+                    }
+                },
+                {
+                    "host": [ "{{.b4}}" ],
+                    "url_pattern": "/",
+                    "extra_config":{
+                        "backend/http":{
+                            "return_error_code":true
+                        }
+                    }
                 }
             ]
         }

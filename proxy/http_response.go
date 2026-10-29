@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
@@ -7,7 +8,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/luraproject/lura/encoding"
+	"github.com/luraproject/lura/v3/encoding"
 )
 
 // HTTPResponseParser defines how the response is parsed from http.Response to Response object
@@ -30,13 +31,17 @@ type HTTPResponseParserFactory func(HTTPResponseParserConfig) HTTPResponseParser
 
 // DefaultHTTPResponseParserFactory is the default implementation of HTTPResponseParserFactory
 func DefaultHTTPResponseParserFactory(cfg HTTPResponseParserConfig) HTTPResponseParser {
-	return func(ctx context.Context, resp *http.Response) (*Response, error) {
+	return func(_ context.Context, resp *http.Response) (*Response, error) {
 		defer resp.Body.Close()
 
 		var reader io.ReadCloser
 		switch resp.Header.Get("Content-Encoding") {
 		case "gzip":
-			reader, _ = gzip.NewReader(resp.Body)
+			gzipReader, err := gzip.NewReader(resp.Body)
+			if err != nil {
+				return nil, err
+			}
+			reader = gzipReader
 			defer reader.Close()
 		default:
 			reader = resp.Body

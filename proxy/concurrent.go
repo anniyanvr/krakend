@@ -1,24 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
-	"github.com/luraproject/lura/config"
+	"github.com/luraproject/lura/v3/config"
+	"github.com/luraproject/lura/v3/logging"
 )
 
-// NewConcurrentMiddleware creates a proxy middleware that enables sending several requests concurrently
-func NewConcurrentMiddleware(remote *config.Backend) Middleware {
+// NewConcurrentMiddlewareWithLogger creates a proxy middleware that enables sending several requests concurrently
+func NewConcurrentMiddlewareWithLogger(logger logging.Logger, remote *config.Backend) Middleware {
 	if remote.ConcurrentCalls == 1 {
-		panic(ErrTooManyProxies)
+		logger.Fatal(fmt.Sprintf("too few concurrent calls for %s %s -> %s: NewConcurrentMiddleware expects more than 1 concurrent call, got %d",
+			remote.ParentEndpointMethod, remote.ParentEndpoint, remote.URLPattern, remote.ConcurrentCalls))
+		return nil
 	}
 	serviceTimeout := time.Duration(75*remote.Timeout.Nanoseconds()/100) * time.Nanosecond
 
 	return func(next ...Proxy) Proxy {
 		if len(next) > 1 {
-			panic(ErrTooManyProxies)
+			logger.Fatal(fmt.Sprintf("too many proxies for this %s %s -> %s proxy middleware: NewConcurrentMiddleware only accepts 1 proxy, got %d",
+				remote.ParentEndpointMethod, remote.ParentEndpoint, remote.URLPattern, len(next)))
+			return nil
 		}
 
 		return func(ctx context.Context, request *Request) (*Response, error) {
@@ -28,7 +35,11 @@ func NewConcurrentMiddleware(remote *config.Backend) Middleware {
 			failed := make(chan error, remote.ConcurrentCalls)
 
 			for i := 0; i < remote.ConcurrentCalls; i++ {
-				go processConcurrentCall(localCtx, next[0], request, results, failed)
+				if i < remote.ConcurrentCalls-1 {
+					go processConcurrentCall(localCtx, next[0], CloneRequest(request), results, failed)
+				} else {
+					go processConcurrentCall(localCtx, next[0], request, results, failed)
+				}
 			}
 
 			var response *Response
@@ -49,6 +60,12 @@ func NewConcurrentMiddleware(remote *config.Backend) Middleware {
 			return response, err
 		}
 	}
+}
+
+// NewConcurrentMiddleware creates a proxy middleware that enables sending several requests concurrently.
+// Is recommended to use the version with a logger param.
+func NewConcurrentMiddleware(remote *config.Backend) Middleware {
+	return NewConcurrentMiddlewareWithLogger(logging.NoOp, remote)
 }
 
 var errNullResult = errors.New("invalid response")

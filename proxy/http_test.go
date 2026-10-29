@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
@@ -11,12 +12,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/luraproject/lura/config"
-	"github.com/luraproject/lura/encoding"
-	"github.com/luraproject/lura/transport/http/client"
+	"github.com/luraproject/lura/v3/config"
+	"github.com/luraproject/lura/v3/encoding"
+	"github.com/luraproject/lura/v3/transport/http/client"
 )
 
 func TestNewHTTPProxy_ok(t *testing.T) {
@@ -96,7 +99,7 @@ func TestNewHTTPProxy_ok(t *testing.T) {
 
 func TestNewHTTPProxy_cancel(t *testing.T) {
 	expectedMethod := "GET"
-	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		time.Sleep(time.Duration(300) * time.Millisecond)
 	}))
 	defer backendServer.Close()
@@ -133,7 +136,7 @@ func TestNewHTTPProxy_cancel(t *testing.T) {
 
 func TestNewHTTPProxy_badResponseBody(t *testing.T) {
 	expectedMethod := "GET"
-	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, "supu")
 	}))
 	defer backendServer.Close()
@@ -168,7 +171,7 @@ func TestNewHTTPProxy_badResponseBody(t *testing.T) {
 
 func TestNewHTTPProxy_badStatusCode(t *testing.T) {
 	expectedMethod := "GET"
-	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "booom", 500)
 	}))
 	defer backendServer.Close()
@@ -188,7 +191,7 @@ func TestNewHTTPProxy_badStatusCode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(10)*time.Millisecond)
 	defer cancel()
 	response, err := httpProxy(&backend)(ctx, &request)
-	if err == nil || err != client.ErrInvalidStatusCode {
+	if err == nil || !strings.HasPrefix(err.Error(), "invalid status code") {
 		t.Errorf("The proxy didn't propagate the backend error: %s\n", err)
 	}
 	if response != nil {
@@ -203,7 +206,7 @@ func TestNewHTTPProxy_badStatusCode(t *testing.T) {
 
 func TestNewHTTPProxy_badStatusCode_detailed(t *testing.T) {
 	expectedMethod := "GET"
-	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "booom", 500)
 	}))
 	defer backendServer.Close()
@@ -239,7 +242,7 @@ func TestNewHTTPProxy_badStatusCode_detailed(t *testing.T) {
 		t.Errorf("unexpected error code: %d", response.Metadata.StatusCode)
 	}
 	b, _ := json.Marshal(response.Data)
-	if string(b) != `{"error_some":{"http_status_code":500,"http_body":"booom\n"}}` {
+	if string(b) != `{"error_some":{"http_status_code":500,"http_body":"booom\n","http_body_encoding":"text/plain; charset=utf-8"}}` {
 		t.Errorf("unexpected response content: %s", string(b))
 	}
 	select {
@@ -251,7 +254,7 @@ func TestNewHTTPProxy_badStatusCode_detailed(t *testing.T) {
 
 func TestNewHTTPProxy_decodingError(t *testing.T) {
 	expectedMethod := "GET"
-	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, `{"supu": 42}`)
 	}))
 	defer backendServer.Close()
@@ -287,7 +290,7 @@ func TestNewHTTPProxy_decodingError(t *testing.T) {
 }
 
 func TestNewHTTPProxy_badMethod(t *testing.T) {
-	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		t.Error("The handler shouldn't be called")
 	}))
 	defer backendServer.Close()
@@ -326,7 +329,7 @@ func TestNewHTTPProxy_badMethod(t *testing.T) {
 }
 
 func TestNewHTTPProxy_requestKo(t *testing.T) {
-	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		t.Error("The handler shouldn't be called")
 	}))
 	defer backendServer.Close()
@@ -346,7 +349,7 @@ func TestNewHTTPProxy_requestKo(t *testing.T) {
 	}
 	mustEnd := time.After(time.Duration(150) * time.Millisecond)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(10)*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(100)*time.Millisecond)
 	defer cancel()
 
 	expectedError := fmt.Errorf("MAYDAY, MAYDAY")
@@ -372,15 +375,15 @@ func TestNewRequestBuilderMiddleware_ok(t *testing.T) {
 	expected := errors.New("error to be propagated")
 	expectedMethod := "GET"
 	expectedPath := "/supu"
-	assertion := func(ctx context.Context, request *Request) (*Response, error) {
+	assertion := func(_ context.Context, request *Request) (*Response, error) {
 		if request.Method != expectedMethod {
 			err := fmt.Errorf("Wrong request method. Want: %s. Have: %s", expectedMethod, request.Method)
-			t.Errorf(err.Error())
+			t.Error(err.Error())
 			return nil, err
 		}
 		if request.Path != expectedPath {
 			err := fmt.Errorf("Wrong request path. Want: %s. Have: %s", expectedPath, request.Path)
-			t.Errorf(err.Error())
+			t.Error(err.Error())
 			return nil, err
 		}
 		return nil, expected
@@ -397,17 +400,6 @@ func TestNewRequestBuilderMiddleware_ok(t *testing.T) {
 	if response != nil {
 		t.Errorf("We weren't expecting a response but we got one: %v\n", response)
 	}
-}
-
-func TestNewRequestBuilderMiddleware_multipleNext(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic\n")
-		}
-	}()
-	sampleBackend := config.Backend{}
-	mw := NewRequestBuilderMiddleware(&sampleBackend)
-	mw(explosiveProxy(t), explosiveProxy(t))
 }
 
 func TestDefaultHTTPResponseParserConfig_nopDecoder(t *testing.T) {
@@ -437,7 +429,7 @@ func TestDefaultHTTPResponseParserConfig_nopEntityFormatter(t *testing.T) {
 
 func TestNewHTTPProxy_noopDecoder(t *testing.T) {
 	expectedcontent := "some nice, interesting and long content"
-	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("header1", "value1")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(expectedcontent))
@@ -495,5 +487,71 @@ func TestNewHTTPProxy_noopDecoder(t *testing.T) {
 	}
 	if content := b.String(); content != expectedcontent {
 		t.Error("unexpected content:", content)
+	}
+}
+
+func TestNewHTTPProxy_redirectWithBody(t *testing.T) {
+	var executed atomic.Uint64
+	expectedBody := `{"message":"redirected"}`
+	expectedResponse := `{"message":"ok"}`
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if string(data) != expectedBody {
+			t.Errorf("invalid data: %s", string(data))
+			return
+		}
+		executed.Add(1)
+		w.Write([]byte(`{"message":"ok"}`))
+	}))
+	defer backendServer.Close()
+	redirServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		executed.Add(1)
+		http.Redirect(w, r, backendServer.URL, http.StatusPermanentRedirect)
+	}))
+	defer redirServer.Close()
+
+	rpURL, _ := url.Parse(redirServer.URL)
+	backend := config.Backend{
+		Decoder: encoding.JSONDecoder,
+		ExtraConfig: map[string]interface{}{
+			clientHTTPOptions: map[string]interface{}{
+				clientHTTPOptionRedirectPost: true,
+			},
+		},
+	}
+	request := Request{
+		Method: "POST",
+		Path:   "/",
+		URL:    rpURL,
+		Body:   newDummyReadCloser(expectedBody),
+	}
+	mustEnd := time.After(time.Duration(150) * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(100)*time.Millisecond)
+	defer cancel()
+	response, err := httpProxy(&backend)(ctx, &request)
+	if err != nil {
+		t.Errorf("The proxy propagated a backend errors: %s\n", err)
+		return
+	}
+	respData, err := json.Marshal(response.Data)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if string(respData) != expectedResponse {
+		t.Errorf("unexpected response data: '%s'", string(respData))
+	}
+	select {
+	case <-mustEnd:
+		t.Errorf("Error: expected response")
+	default:
+	}
+	if executed.Load() != 2 {
+		t.Errorf("number of executions should be 2 not %d", executed.Load())
 	}
 }

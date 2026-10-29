@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
@@ -8,14 +9,15 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/luraproject/lura/config"
-	"github.com/luraproject/lura/sd/dnssrv"
+	"github.com/luraproject/lura/v3/config"
+	"github.com/luraproject/lura/v3/logging"
+	"github.com/luraproject/lura/v3/sd/dnssrv"
 )
 
 func TestNewLoadBalancedMiddleware_ok(t *testing.T) {
 	want := "supu:8080/tupu"
-	lb := newLoadBalancedMiddleware(dummyBalancer("supu:8080"))
-	assertion := func(ctx context.Context, request *Request) (*Response, error) {
+	lb := newLoadBalancedMiddleware(logging.NoOp, dummyBalancer("supu:8080"))
+	assertion := func(_ context.Context, request *Request) (*Response, error) {
 		if request.URL.String() != want {
 			t.Errorf("The middleware did not update the request URL! want [%s], have [%s]\n", want, request.URL)
 		}
@@ -28,19 +30,9 @@ func TestNewLoadBalancedMiddleware_ok(t *testing.T) {
 	}
 }
 
-func TestNewLoadBalancedMiddleware_multipleNext(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic\n")
-		}
-	}()
-	lb := newLoadBalancedMiddleware(dummyBalancer("supu"))
-	lb(explosiveProxy(t), explosiveProxy(t))
-}
-
 func TestNewLoadBalancedMiddleware_explosiveBalancer(t *testing.T) {
 	expected := errors.New("supu")
-	lb := newLoadBalancedMiddleware(explosiveBalancer{expected})
+	lb := newLoadBalancedMiddleware(logging.NoOp, explosiveBalancer{expected})
 	if _, err := lb(explosiveProxy(t))(context.Background(), &Request{}); err != expected {
 		t.Errorf("The middleware did not propagate the lb error\n")
 	}
@@ -83,7 +75,7 @@ func testLoadBalancedMw(t *testing.T, lb Middleware) {
 			expected: "http://127.0.0.1:8080/tupu?some=none",
 		},
 	} {
-		assertion := func(ctx context.Context, request *Request) (*Response, error) {
+		assertion := func(_ context.Context, request *Request) (*Response, error) {
 			if request.URL.String() != tc.expected {
 				t.Errorf("The middleware did not update the request URL! want [%s], have [%s]\n", tc.expected, request.URL)
 			}
@@ -102,7 +94,7 @@ func TestNewLoadBalancedMiddleware_parsingError(t *testing.T) {
 	lb := NewRandomLoadBalancedMiddleware(&config.Backend{
 		Host: []string{"127.0.0.1:8080"},
 	})
-	assertion := func(ctx context.Context, request *Request) (*Response, error) {
+	assertion := func(_ context.Context, _ *Request) (*Response, error) {
 		t.Error("The middleware didn't block the request!")
 		return nil, nil
 	}
@@ -116,11 +108,12 @@ func TestNewLoadBalancedMiddleware_parsingError(t *testing.T) {
 func TestNewRoundRobinLoadBalancedMiddleware_DNSSRV(t *testing.T) {
 	defaultLookup := dnssrv.DefaultLookup
 
-	dnssrv.DefaultLookup = func(service, proto, name string) (cname string, addrs []*net.SRV, err error) {
+	dnssrv.DefaultLookup = func(_, _, _ string) (cname string, addrs []*net.SRV, err error) {
 		return "cname", []*net.SRV{
 			{
 				Port:   8080,
 				Target: "127.0.0.1",
+				Weight: 1,
 			},
 		}, nil
 	}

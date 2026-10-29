@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"net/url"
+	"sync"
 )
 
 // Request contains the data to send to the backend
@@ -27,11 +28,12 @@ func (r *Request) GeneratePath(URLPattern string) {
 	}
 	buff := []byte(URLPattern)
 	for k, v := range r.Params {
-		key := []byte{}
+		var key []byte
+
 		key = append(key, "{{."...)
 		key = append(key, k...)
 		key = append(key, "}}"...)
-		buff = bytes.Replace(buff, key, []byte(v), -1)
+		buff = bytes.ReplaceAll(buff, key, []byte(v))
 	}
 	r.Path = string(buff)
 }
@@ -42,15 +44,27 @@ func (r *Request) GeneratePath(URLPattern string) {
 // For thread-safe request headers and/or params manipulation, use the proxy.CloneRequest
 // function.
 func (r *Request) Clone() Request {
+	var clonedURL *url.URL
+	if r.URL != nil {
+		clonedURL, _ = url.Parse(r.URL.String())
+	}
 	return Request{
 		Method:  r.Method,
-		URL:     r.URL,
+		URL:     clonedURL,
 		Query:   r.Query,
 		Path:    r.Path,
 		Body:    r.Body,
 		Params:  r.Params,
 		Headers: r.Headers,
 	}
+}
+
+// bufferPool is a pool of bytes.Buffer used to reduce memory allocations
+// during request body cloning in the proxy pipeline.
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
 }
 
 // CloneRequest returns a deep copy of the received request, so the received and the
@@ -62,12 +76,20 @@ func CloneRequest(r *Request) *Request {
 	if r.Body == nil {
 		return &clone
 	}
-	buf := new(bytes.Buffer)
+	buf := bufferPool.Get().(*bytes.Buffer)
+	defer bufferPool.Put(buf)
+	buf.Reset()
 	buf.ReadFrom(r.Body)
 	r.Body.Close()
 
-	r.Body = ioutil.NopCloser(bytes.NewReader(buf.Bytes()))
-	clone.Body = ioutil.NopCloser(buf)
+	data := buf.Bytes()
+	originalBody := make([]byte, len(data))
+	copy(originalBody, data)
+	clonedBody := make([]byte, len(data))
+	copy(clonedBody, data)
+
+	r.Body = io.NopCloser(bytes.NewReader(originalBody))
+	clone.Body = io.NopCloser(bytes.NewReader(clonedBody))
 
 	return &clone
 }

@@ -1,21 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 
-	"github.com/luraproject/lura/config"
+	"github.com/luraproject/lura/v3/config"
+	"github.com/luraproject/lura/v3/logging"
 )
 
 // NewStaticMiddleware creates proxy middleware for adding static values to the processed responses
-func NewStaticMiddleware(endpointConfig *config.EndpointConfig) Middleware {
+func NewStaticMiddleware(logger logging.Logger, endpointConfig *config.EndpointConfig) Middleware {
 	cfg, ok := getStaticMiddlewareCfg(endpointConfig.ExtraConfig)
 	if !ok {
-		return EmptyMiddleware
+		return emptyMiddlewareFallback(logger)
 	}
+
+	b, _ := json.Marshal(cfg.Data)
+
+	logger.Debug(
+		fmt.Sprintf(
+			"[ENDPOINT: %s %s][Static] Adding a static response using '%s' strategy. Data: %s",
+			endpointConfig.Method,
+			endpointConfig.Endpoint,
+			cfg.Strategy,
+			string(b),
+		),
+	)
+
 	return func(next ...Proxy) Proxy {
 		if len(next) > 1 {
-			panic(ErrTooManyProxies)
+			logger.Fatal("too many proxies for this proxy middleware: NewStaticMiddleware only accepts 1 proxy, got %d", len(next))
+			return nil
 		}
 		return func(ctx context.Context, request *Request) (*Response, error) {
 			result, err := next[0](ctx, request)
